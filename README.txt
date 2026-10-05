@@ -1,4 +1,4 @@
-同心结 PolyRomance Mod  v1.1.0
+同心结 PolyRomance Mod  v1.3.2
 ====================================
 作者：茹鸦reyalp
 仓库：https://github.com/ReyalpWondery/Sovereign-Tower-PolyRomanceMod
@@ -24,10 +24,14 @@
    任务成功率评分与存档完全不受影响（菜单可开关）。
 6. The Wolf 与人类 Rufus 共存 —— 原版治愈狼形态会强制 The Wolf 离队，
    模组拦截该离队信号，两种形态可同时留在队中（菜单可开关）。
+7. 圆桌选择栏适配 12 人以上 —— 原版只预置 12 个骑士头像，第 13 名起看不到也选不了；
+   模组自动补齐头像并整体缩小排列（避开左侧任务栏与右下按钮的遮挡区）；
+   也可在 F8 菜单切换为滑轮窗模式（选中者居中、滚动切换）。
 
 【模组菜单（游戏内按 F8）】
 - 查看每名可攻略角色的浪漫值，可 +3 / 一键圆满 / 解锁婚礼
 - 上述第 3、5、6 项的开关
+- 调试按钮：一键全员入队 + 数值拉满（供测试 UI/剧情用，请勿在正式存档上使用）
 
 安装：
 1. 把整个 PolyRomanceMod 文件夹放进游戏目录（sovereign_tower.exe 所在目录）。
@@ -48,7 +52,8 @@
 文件清单：
 - mod_files/mod_entry.gd           模组主脚本（注入为 autoload）
 - mod_files/character_manager.gd   修改版角色管理器（圆桌上限 99）
-- mod_files/panku_manager.gd.remap / character_manager.gd.remap  入口重定向
+- mod_files/curved_hbox.gd         修改版圆桌头像弧形排列（>12 人自动缩小）
+- mod_files/panku_manager.gd.remap / character_manager.gd.remap / curved_hbox.gd.remap  入口重定向
 - tools/pck_tool.py                PCK 解析/补丁工具
 - tools/install_mod.py / uninstall_mod.py  安装/卸载逻辑
 - 安装模组.bat / 卸载模组.bat       一键脚本（需要系统装有 Python 3）

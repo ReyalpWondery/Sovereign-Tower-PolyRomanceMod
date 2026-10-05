@@ -7,11 +7,12 @@ extends Node
 #   2. 圆桌人数上限解除（由 character_manager.gd 覆盖文件提供，恒 99）
 #   3. 任务出战人数上限解除（圆桌开放期间临时提升，结算前还原，不影响任务评分）
 #   4. The Wolf 与人类 Rufus 共存（拦截治愈剧情中的狼离队信号）
+#   5. 圆桌骑士超过 12 人时补齐选择头像 + 底部棋子栏滑轮窗（选中居中滚动）
 # 注入方式：覆盖 PankuManager autoload（原功能已完整保留）
 # 按 F8 打开/关闭模组菜单
 # ============================================================
 
-const MOD_VERSION := "1.1.0"
+const MOD_VERSION := "1.3.2"
 const CONFIG_PATH := "user://poly_romance.cfg"
 const QUEST_MAX_SLOTS := 10
 
@@ -31,6 +32,8 @@ var _quest_cap_originals := {}
 
 var _wolf_coexist: bool = true
 var _demission_filter_installed: bool = false
+
+var _vignette_carousel: bool = false
 
 
 func _ready() -> void:
@@ -120,6 +123,7 @@ func _deferred_setup() -> void:
 	if sc != null and sc.has_signal("story_loaded"):
 		sc.connect("story_loaded", _on_story_loaded)
 	_reapply_loop()
+	_start_slot_tint_loop()
 
 
 func _connect_if(obj: Object, sig: String, fn: Callable) -> void:
@@ -133,6 +137,7 @@ func _reapply_loop() -> void:
 		await get_tree().create_timer(2.0).timeout
 		_apply_polyamory()
 		_install_demission_filter()
+		_ensure_knight_vignettes()
 		if i == 4:
 			_diag("boot")
 
@@ -225,6 +230,10 @@ func _on_ending_triggered(_ending = null) -> void:
 # 圆桌结束时还原原值，任务结算使用原版数值，不影响评分与存档。
 
 func _on_roundtable_opened(_a = null, _b = null) -> void:
+	# 延迟到本帧末尾：原版 set_up 会在信号之后连接现有头像的 pressed，
+	# 我们先补齐的话原版会对新头像重复连接报错
+	call_deferred("_ensure_knight_vignettes")
+	_vignette_retry_later()
 	if not _quest_cap_enabled:
 		return
 	var qm := _quests_manager()
@@ -308,6 +317,204 @@ func _on_knight_demission_filtered(character_name: String) -> void:
 		cm._on_story_instruction_knight_demission(character_name)
 
 
+# ==================== 功能 5：圆桌骑士头像扩展（>12 人） ====================
+# 原版场景只预置了 12 个 KnightVignette，_set_up_knights 不会创建新头像，
+# 第 13 名起的骑士看不到也选不了。圆桌打开时按实际骑士数复制补齐头像，
+# 接好按钮组与选中信号；超过 12 人时底部棋子栏启用滑轮窗（选中居中滚动），
+# 极端情况下 curved_hbox.gd 覆盖文件还会自动缩小排列并避开两侧 UI 遮挡。
+
+func _ensure_knight_vignettes() -> void:
+	var cm := _char_manager()
+	if cm == null:
+		return
+	var knights = cm.get("roundtable_knights")
+	if knights == null:
+		return
+	for rt in get_tree().get_nodes_in_group("RoundTable"):
+		_top_up_knight_vignettes(rt, knights.size())
+		_hook_vignette_window_signals(rt)
+		_apply_vignette_window(rt)
+
+
+func _vignette_retry_later() -> void:
+	await get_tree().create_timer(1.5).timeout
+	_ensure_knight_vignettes()
+
+
+func _top_up_knight_vignettes(rt: Node, knight_count: int) -> void:
+	var display = rt.get("knight_vignettes_display")
+	if display == null:
+		return
+	var box = display.get("knight_vignettes")
+	if box == null:
+		return
+	var missing: int = knight_count - box.get_child_count()
+	if missing <= 0:
+		return
+	var template: Node = null
+	for child in box.get_children():
+		if child.get("vignette_button") != null:
+			template = child
+			break
+	if template == null or not rt.has_method("_on_knight_vignette_pressed"):
+		return
+	var template_button = template.get("vignette_button")
+	var added := 0
+	for i in range(missing):
+		var v: Node = template.duplicate()
+		v.name = "KnightVignetteExtra%d" % (box.get_child_count() + i)
+		box.add_child(v)
+		v.set("is_button_pressed", false)
+		v.set("disabled", false)
+		for prop in ["lock", "away", "assigned", "training", "notification_discussion", "notification_level_up"]:
+			var sub = v.get(prop)
+			if sub != null:
+				sub.visible = false
+		var vb = v.get("vignette_button")
+		if vb != null and template_button != null and template_button.button_group != null:
+			vb.button_group = template_button.button_group
+		var cb := Callable(rt, "_on_knight_vignette_pressed").bind(v)
+		if not v.is_connected("pressed", cb):
+			v.connect("pressed", cb)
+		added += 1
+	if added > 0:
+		if rt.has_method("_set_up_knights"):
+			rt._set_up_knights()
+		_log("[PolyRomance] 圆桌骑士 %d 名，已补齐 %d 个选择头像" % [knight_count, added])
+
+
+# ---- 底部棋子栏滑轮窗（>12 人） ----
+# 12 人以内完全走原版。超过后只显示选中棋子前后各 5 个（共 11 个），
+# 保持原版大小与间距（可见数 ≤12 时 curved_hbox 自动走原版路径）；
+# 切换选中时窗口跟随滚动。中央立绘保持原版逻辑（只显示选中者），不干预。
+
+const VIGNETTE_WINDOW_HALF := 5
+var _last_vignette_window_log := ""
+
+func _hook_vignette_window_signals(rt: Node) -> void:
+	var display = rt.get("knight_vignettes_display")
+	if display == null:
+		return
+	var box = display.get("knight_vignettes")
+	if box == null:
+		return
+	for v in box.get_children():
+		if v.has_meta("poly_pawn_hook") or not v.has_signal("pressed"):
+			continue
+		v.set_meta("poly_pawn_hook", true)
+		v.connect("pressed", _on_vignette_window_pressed.bind(rt))
+
+
+func _on_vignette_window_pressed(rt: Node) -> void:
+	# 等两帧让原版选中状态落定后再滚动窗口
+	await get_tree().process_frame
+	await get_tree().process_frame
+	if is_instance_valid(rt):
+		_apply_vignette_window(rt)
+
+
+func _apply_vignette_window(rt: Node) -> void:
+	var cm := _char_manager()
+	if cm == null:
+		return
+	var knights = cm.get("roundtable_knights")
+	if knights == null:
+		return
+	var display = rt.get("knight_vignettes_display")
+	if display == null:
+		return
+	var box = display.get("knight_vignettes")
+	if box == null:
+		return
+	# 已分配骑士的头像（容器顺序即骑士顺序）
+	var assigned := []
+	for v in box.get_children():
+		var k = v.get("knight")
+		if k != null and is_instance_valid(k):
+			assigned.append(v)
+	if assigned.size() <= 12 or not _vignette_carousel:
+		# 人数回落或滑轮窗关闭：只恢复我们自己隐藏的头像
+		for v in box.get_children():
+			if v.has_meta("poly_vhidden"):
+				v.remove_meta("poly_vhidden")
+				v.visible = true
+		return
+	var sel := 0
+	var selected = rt.get("current_selected_knight")
+	if selected != null and is_instance_valid(selected):
+		for i in range(assigned.size()):
+			if assigned[i].get("knight") == selected:
+				sel = i
+				break
+	var window_size: int = VIGNETTE_WINDOW_HALF * 2 + 1
+	var from: int = clamp(sel - VIGNETTE_WINDOW_HALF, 0, max(0, assigned.size() - window_size))
+	var to: int = min(from + window_size - 1, assigned.size() - 1)
+	var changed := 0
+	for i in range(assigned.size()):
+		var v = assigned[i]
+		if i >= from and i <= to:
+			if v.has_meta("poly_vhidden"):
+				v.remove_meta("poly_vhidden")
+				v.visible = true
+				changed += 1
+		else:
+			if v.visible:
+				v.visible = false
+				changed += 1
+			v.set_meta("poly_vhidden", true)
+	if changed > 0:
+		if box.has_method("layout_children"):
+			box.layout_children()
+		var key := "%d-%d/%d" % [from, to, assigned.size()]
+		if key != _last_vignette_window_log:
+			_last_vignette_window_log = key
+			_log("[PolyRomance] 棋子滑轮窗：显示 %d-%d/%d" % [from, to, assigned.size()])
+
+
+# ---- 任务槽位染色：区分原版槽位与模组新增槽位 ----
+# 模组把任务出战上限临时提到 10 后，超出原版人数的槽位染淡蓝色，
+# 鼠标悬停有说明；hover 灰化用的是 modulate，与 self_modulate 互不干扰。
+
+const EXTRA_SLOT_TINT := Color(0.55, 0.8, 1.0)
+var _slot_tint_running := false
+
+func _start_slot_tint_loop() -> void:
+	if _slot_tint_running:
+		return
+	_slot_tint_running = true
+	while true:
+		await get_tree().create_timer(0.5).timeout
+		_tint_quest_slots()
+		# 棋子滑轮窗持续校正：原版若干流程会重置头像显隐
+		for rt in get_tree().get_nodes_in_group("RoundTable"):
+			_apply_vignette_window(rt)
+
+
+func _tint_quest_slots() -> void:
+	for rt in get_tree().get_nodes_in_group("RoundTable"):
+		var qps = rt.get("quest_presentation_section")
+		if qps == null:
+			continue
+		var container = qps.get("knight_slots_container")
+		if container == null:
+			continue
+		var quest = qps.get("selected_quest")
+		var original := -1
+		if quest != null and is_instance_valid(quest):
+			original = _quest_cap_originals.get(quest, quest.get("nb_requested_knights"))
+		var idx := -1
+		for child in container.get_children():
+			if not child is AspectRatioContainer:
+				continue
+			idx += 1
+			if child.get_child_count() == 0:
+				continue
+			var slot = child.get_child(0)
+			var is_extra: bool = original >= 0 and idx >= original and child.visible
+			slot.self_modulate = EXTRA_SLOT_TINT if is_extra else Color.WHITE
+			slot.tooltip_text = "模组新增槽位（超出原版出战人数）" if is_extra else ""
+
+
 # ==================== 模组菜单 (F8) ====================
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -335,6 +542,7 @@ func _build_ui() -> void:
 	panel.anchor_right = 1.0
 	panel.anchor_top = 0.5
 	panel.anchor_bottom = 0.5
+	panel.clip_contents = true
 	_panel = panel
 	_reposition_panel()
 	get_viewport().size_changed.connect(_reposition_panel)
@@ -379,26 +587,48 @@ func _build_ui() -> void:
 	all_max.pressed.connect(_on_all_full_romance)
 	all_row.add_child(all_max)
 
+	var debug_btn := Button.new()
+	debug_btn.text = "【调试】全员入队+数值拉满"
+	debug_btn.tooltip_text = "招募全部骑士与仆人，浪漫/好感/等级/护甲拉满。仅供调试 UI 与剧情，建议在测试存档上使用。"
+	debug_btn.add_theme_font_size_override("font_size", 13)
+	debug_btn.pressed.connect(_on_debug_recruit_max)
+	vbox.add_child(debug_btn)
+
 	_lock_toggle = CheckButton.new()
-	_lock_toggle.text = "绕过 Gideon 婚姻锁（允许已婚后再结婚）"
+	_lock_toggle.text = "绕过 Gideon 婚姻锁"
+	_lock_toggle.tooltip_text = "允许已婚后再结婚；结局时自动恢复 Gideon 已婚状态"
+	_lock_toggle.add_theme_font_size_override("font_size", 13)
 	_lock_toggle.button_pressed = _bypass_marriage_lock
 	_lock_toggle.toggled.connect(_on_lock_toggled)
 	vbox.add_child(_lock_toggle)
 
 	var quest_toggle := CheckButton.new()
-	quest_toggle.text = "解除任务出战人数上限（最多 10 人/任务）"
+	quest_toggle.text = "解除任务出战人数上限"
+	quest_toggle.tooltip_text = "圆桌开放期间每个任务最多派 10 名骑士；结算前还原原版数值，不影响评分与存档"
+	quest_toggle.add_theme_font_size_override("font_size", 13)
 	quest_toggle.button_pressed = _quest_cap_enabled
 	quest_toggle.toggled.connect(_on_quest_cap_toggled)
 	vbox.add_child(quest_toggle)
 
 	var wolf_toggle := CheckButton.new()
-	wolf_toggle.text = "The Wolf 与人类 Rufus 共存"
+	wolf_toggle.text = "The Wolf / Rufus 共存"
+	wolf_toggle.tooltip_text = "治愈狼形态时不强制 The Wolf 离队，两种形态同时留在队中"
+	wolf_toggle.add_theme_font_size_override("font_size", 13)
 	wolf_toggle.button_pressed = _wolf_coexist
 	wolf_toggle.toggled.connect(_on_wolf_toggled)
 	vbox.add_child(wolf_toggle)
 
+	var carousel_toggle := CheckButton.new()
+	carousel_toggle.text = "棋子栏滑轮窗（>12 人）"
+	carousel_toggle.tooltip_text = "开启后只显示选中棋子前后各 5 个；关闭则全员缩小显示"
+	carousel_toggle.add_theme_font_size_override("font_size", 13)
+	carousel_toggle.button_pressed = _vignette_carousel
+	carousel_toggle.toggled.connect(_on_carousel_toggled)
+	vbox.add_child(carousel_toggle)
+
 	var note := Label.new()
-	note.text = "圆桌人数上限已由模组文件永久解除（99 人）。"
+	note.text = "圆桌人数上限已由模组文件永久解除（99 人）；超过 12 人时底部棋子栏自动缩小排列。"
+	note.add_theme_font_size_override("font_size", 12)
 	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vbox.add_child(note)
 
@@ -406,6 +636,7 @@ func _build_ui() -> void:
 
 	var author := Label.new()
 	author.text = "作者：茹鸦reyalp\n本模组为玩家自制，与官方 WILD WITS GAMES 无关；仅供学习交流，使用风险自负。\nhttps://github.com/ReyalpWondery/Sovereign-Tower-PolyRomanceMod"
+	author.add_theme_font_size_override("font_size", 12)
 	author.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vbox.add_child(author)
 
@@ -464,14 +695,16 @@ func _make_row(c) -> HBoxContainer:
 	row.add_theme_constant_override("separation", 4)
 
 	var info := Label.new()
-	info.custom_minimum_size = Vector2(170, 0)
+	info.custom_minimum_size = Vector2(130, 0)
 	info.clip_text = true
+	info.add_theme_font_size_override("font_size", 13)
 	row.add_child(info)
 	_update_row_label(info, c)
 
 	var plus := Button.new()
 	plus.text = "浪漫+3"
 	plus.tooltip_text = "增加 3 点浪漫值"
+	plus.add_theme_font_size_override("font_size", 13)
 	plus.pressed.connect(func(): _on_plus3(c, info))
 	row.add_child(plus)
 
@@ -480,6 +713,7 @@ func _make_row(c) -> HBoxContainer:
 		var full := Button.new()
 		full.text = "恋爱圆满"
 		full.tooltip_text = "浪漫值拉满并解锁完整恋爱剧情"
+		full.add_theme_font_size_override("font_size", 13)
 		full.pressed.connect(func(): _on_full_romance(c, info))
 		row.add_child(full)
 
@@ -487,6 +721,7 @@ func _make_row(c) -> HBoxContainer:
 		var wed := Button.new()
 		wed.text = "举办婚礼"
 		wed.tooltip_text = "解锁与该骑士的婚礼仪式（自由时间触发，可重复）"
+		wed.add_theme_font_size_override("font_size", 13)
 		wed.pressed.connect(func(): _on_wedding(c))
 		row.add_child(wed)
 
@@ -600,6 +835,59 @@ func _on_all_full_romance() -> void:
 	_refresh_rows()
 
 
+# 【调试】一键全员入队 + 数值拉满，用于查看 UI 与剧情效果
+func _on_debug_recruit_max() -> void:
+	var cm := _char_manager()
+	if cm == null:
+		_log("[PolyRomance] 调试按钮：未进入游戏，忽略")
+		return
+	var recruited := 0
+	var rk = cm.get("recruitable_knights")
+	if rk != null and cm.has_method("_recruit_knight"):
+		var rt_knights = cm.get("roundtable_knights")
+		for k in rk.duplicate():
+			if not is_instance_valid(k) or k.get("is_dead") == true:
+				continue
+			if rt_knights != null and k in rt_knights:
+				continue
+			var ink_id = k.get("character_ink_id")
+			if ink_id == null:
+				continue
+			cm._recruit_knight(ink_id)
+			recruited += 1
+	var servants := 0
+	var rs = cm.get("recruitable_servants")
+	if rs != null and cm.has_method("recruit_servant"):
+		for s in rs.duplicate():
+			if is_instance_valid(s) and s.get("is_dead") != true:
+				cm.recruit_servant(s)
+				servants += 1
+	var maxed := 0
+	for arr_name in ["roundtable_knights", "recruitable_knights", "recruited_servants", "recruitable_servants"]:
+		var arr = cm.get(arr_name)
+		if arr == null:
+			continue
+		for c in arr:
+			if not is_instance_valid(c):
+				continue
+			if c.get("max_romantism") != null:
+				c.set("current_romantism", c.get("max_romantism"))
+			if c.get("max_affinity") != null:
+				c.set("current_affinity", c.get("max_affinity"))
+			if c.get("current_level") != null:
+				c.set("current_level", 15)  # Knight.MAX_LEVEL
+			if c.get("max_armor") != null:
+				c.set("current_armor", c.get("max_armor"))
+			maxed += 1
+	var seb := get_node_or_null("/root/SignalsEventBus")
+	if seb != null and seb.has_signal("knight_stats_update_required"):
+		seb.emit_signal("knight_stats_update_required")
+	_apply_polyamory()
+	_ensure_knight_vignettes()
+	_refresh_rows()
+	_log("[PolyRomance] 调试：新招募骑士 %d 名、仆人 %d 名，%d 个角色数值已拉满" % [recruited, servants, maxed])
+
+
 func _on_lock_toggled(on: bool) -> void:
 	_bypass_marriage_lock = on
 	_save_config()
@@ -627,6 +915,12 @@ func _on_wolf_toggled(on: bool) -> void:
 		_remove_demission_filter()
 
 
+func _on_carousel_toggled(on: bool) -> void:
+	_vignette_carousel = on
+	_save_config()
+	_ensure_knight_vignettes()
+
+
 # ==================== 配置持久化 ====================
 
 func _load_config() -> void:
@@ -637,6 +931,7 @@ func _load_config() -> void:
 	_gideon_really_married = cfg.get_value("mod", "gideon_really_married", false)
 	_quest_cap_enabled = cfg.get_value("mod", "quest_cap_enabled", true)
 	_wolf_coexist = cfg.get_value("mod", "wolf_coexist", true)
+	_vignette_carousel = cfg.get_value("mod", "vignette_carousel", false)
 
 
 func _save_config() -> void:
@@ -645,4 +940,5 @@ func _save_config() -> void:
 	cfg.set_value("mod", "gideon_really_married", _gideon_really_married)
 	cfg.set_value("mod", "quest_cap_enabled", _quest_cap_enabled)
 	cfg.set_value("mod", "wolf_coexist", _wolf_coexist)
+	cfg.set_value("mod", "vignette_carousel", _vignette_carousel)
 	cfg.save(CONFIG_PATH)
